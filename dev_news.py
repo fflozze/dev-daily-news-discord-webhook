@@ -1,5 +1,6 @@
 import os, json, textwrap, re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, urlunparse
 import requests
 
 # ---------- ENV ----------
@@ -11,6 +12,10 @@ LOCALE       = os.getenv("LOCALE", "fr-FR")
 SOURCE_LANGS = os.getenv("SOURCE_LANGS", "fr,en")  # FR + EN
 TZ           = os.getenv("TIMEZONE", "Europe/Paris")
 COLOR        = int(os.getenv("EMBED_COLOR", "15105570"))  # 0xE67E22 (orange)
+
+# Limites de contenu (anti-dup)
+MAX_BULLETS = int(os.getenv("MAX_BULLETS", "8"))
+MAX_LINKS   = int(os.getenv("MAX_LINKS", "12"))
 
 now_utc   = datetime.now(timezone.utc)
 since_utc = now_utc - timedelta(hours=HOURS)
@@ -26,26 +31,138 @@ FIELD_HARD_MAX       = 1024
 FIELD_SOFT_MAX       = 450    # our target (<< 1024)
 DESC_SOFT_MAX        = 180    # short description
 
-# ---------- Helpers ----------
-def _text_len(s: str) -> int:
-    return len(s or "")
+# ---------- Helpers: normalize / dedup ----------
+JUNK_PATTERNS = [
+    r"^\s*share with your followers!?$",
+    r"^\s*publish$",
+    r"^\s*don'?t show again$",
+    r"^cookies? (policy|settings)",
+    r"^accept (all|cookies)",
+    r"^subscribe",
+    r"^sign in",
+    r"^log in",
+    r"^read more",
+    r"^continuer sans accepter",
+    r"^param(è|e)tres? de confidentialit",
+]
+
+def _is_junk_line(line: str) -> bool:
+    s = (line or "").strip().lower()
+    if not s:
+        return True
+    for pat in JUNK_PATTERNS:
+        if re.search(pat, s):
+            return True
+    return False
 
 def _normalize_text(s: str) -> str:
     if not s:
         return ""
     s = s.replace("\r", "")
-    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)  # drop markdown headings inside chunks
-    s = re.sub(r"[ \t]{2,}", " ", s)                     # compress spaces
+    # drop markdown headings, bullets artifacts
+    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^[\-\*\•]\s*", "", s, flags=re.MULTILINE)
+    # compress spaces
+    s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
+
+def _fingerprint(s: str) -> str:
+    """Key for dedup of bullets: lowercase, drop punctuation, collapse spaces."""
+    s = _normalize_text(s).lower()
+    # remove URLs to avoid diff only by utm
+    s = re.sub(r"https?://\S+", "", s)
+    s = re.sub(r"[^\w]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _canonical_url(u: str) -> str:
+    """Normalize URL for link dedup: lower host, drop query/fragment & trailing slash."""
+    if not u:
+        return ""
+    m = re.search(r"(https?://\S+)", u)
+    if m:
+        u = m.group(1)
+    try:
+        p = urlparse(u.strip())
+        host = (p.netloc or "").lower()
+        path = (p.path or "/")
+        # strip trailing slash except root
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        # drop common tracking queries completely
+        new = p._replace(netloc=host, path=path, params="", query="", fragment="")
+        return urlunparse(new)
+    except Exception:
+        return u.strip()
+
+def _dedup_lines(lines, key_fn, limit):
+    seen, out = set(), []
+    for ln in lines:
+        ln_norm = _normalize_text(ln)
+        if not ln_norm or _is_junk_line(ln_norm):
+            continue
+        key = key_fn(ln_norm)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(ln_norm)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+def _lines_from_markdown_block(md: str):
+    """Split a markdown block into 'logical' lines (bullets or paragraphs)."""
+    md = (md or "").strip()
+    if not md:
+        return []
+    # prefer bullet lines
+    bullet_like = re.findall(r"(?m)^\s*(?:\-|\*|•)\s+.+$", md)
+    if bullet_like:
+        return [re.sub(r"^\s*(?:\-|\*|•)\s+", "", x).strip() for x in bullet_like]
+    # otherwise split on blank lines
+    parts = re.split(r"\n\s*\n", md)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # split long paragraphs into sentences-ish chunks to avoid 2k fields
+        if len(p) > 600:
+            for i in range(0, len(p), 300):
+                out.append(p[i:i+300].strip())
+        else:
+            out.append(p)
+    return out
+
+def _format_bullets_md(lines):
+    return "\n".join(f"- {ln}" for ln in lines)
+
+def _extract_link_lines(md: str):
+    """Return raw lines likely to contain links."""
+    md = (md or "").strip()
+    if not md:
+        return []
+    # one per line
+    lines = [x.strip() for x in md.splitlines() if x.strip()]
+    return lines
+
+def _format_links_md(lines):
+    return "\n".join(f"- {ln}" for ln in lines)
+
+# ---------- Discord building / shrinking ----------
+def _text_len(s: str) -> int:
+    return len(s or "")
 
 def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
     """Split by lines; hard-split very long lines (e.g., URLs)."""
-    txt = _normalize_text(txt)
+    txt = (_normalize_text(txt) or "")
     if not txt:
         return []
     lines, chunks, buf = txt.splitlines(), [], ""
     for line in lines:
         line = line.strip()
+        if not line:
+            continue
         add_len = len(line) + (0 if not buf else 1)
         if len(buf) + add_len > size:
             if buf:
@@ -108,12 +225,10 @@ def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
     Aggressive stepwise cuts.
     """
     e = _clean_embed(e)
-    # ensure short description early
     if e.get("description") and len(e["description"]) > DESC_SOFT_MAX:
         e["description"] = e["description"][:DESC_SOFT_MAX] + "…"
         e = _clean_embed(e)
 
-    # target budget loop
     guard = 0
     while _embed_size(e) > target and guard < 100:
         guard += 1
@@ -131,7 +246,6 @@ def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
                 continue
         break
 
-    # final safety: ensure < 6000
     guard = 0
     while _embed_size(e) > DISCORD_MAX_EMBED and guard < 100:
         guard += 1
@@ -159,9 +273,6 @@ def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
     return e
 
 def _retry_shrink_and_send(payload, max_retries=3):
-    """
-    If Discord returns 400 'Embed size exceeds ...', shrink more and retry.
-    """
     for attempt in range(max_retries + 1):
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
         if r.ok:
@@ -304,47 +415,58 @@ def split_summary_links(md: str, fallback_title: str):
 
     return title, bullets, links
 
-# ---------- Prompt ----------
+# ---------- Prompt (DEV-only) ----------
 def build_prompt():
     """
-    DEV NEWS scope:
+    DEV NEWS scope (strict dev):
       - Languages: Python, JS/TS, Go, Rust, Java, C#, etc.
       - Frameworks/Libraries: React, Vue, Angular, Svelte, Django, FastAPI, Spring, .NET, etc.
       - Tooling: package managers, build tools, linters/formatters, IDEs, CLIs
       - Releases/Changelogs: major/minor, breaking changes, deprecations
       - Cloud/DevOps/CI-CD: containers, serverless, IaC, performance
-      - Security: advisories (CVE), supply chain (npm/pypi/crates), patches
-      - Standards/Specs: TC39, WHATWG, W3C, IETF, databases
+      - Security for devs: advisories (CVE) impacting dev/runtime toolchains, supply chain (npm/pypi/crates)
+      - Standards/Specs: TC39, WHATWG, W3C, IETF, DB ecosystems
+      OUT-OF-SCOPE: corporate finance/news unrelated to dev, generic AI policy, city admin platforms sans nouveauté dev,
+                     pop-ups/junk UI texts.
     """
     langs_note = SOURCE_LANGS.replace(",", ", ")
     return textwrap.dedent(f"""
-    Tu es un agent de veille **Développement / Software Engineering**.
+    Tu es un agent de veille **Développement / Software Engineering**. Ne garde que des infos
+    **centrées sur le développement** (langages, frameworks, toolchains, releases, DevOps/CI, specs/standards).
 
     Tâche :
     - Utilise la **recherche web** pour identifier les **actualités dev** publiées entre
       **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** et **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
     - **Sources à considérer** : en **français et en anglais** ({langs_note}). Priorise la **source primaire**
       (notes de version/changelogs officiels, blogs des projets, RFC/propositions TC39, etc.) et les médias réputés.
-      Évite les doublons d’un même événement.
+      **Évite absolument les doublons** d’un même événement.
 
     Rendu en **français ({LOCALE})** et en **Markdown** :
     1) Un titre : "Veille Dev — {date_str} (dernières {HOURS} h)".
     2) Un **résumé global** (2–3 phrases).
-    3) **5–10 puces** factuelles (versions, breaking changes, composants impactés, dates, éditeurs).
-    4) Une section **Liens / Links** (10–15 items max) au format :
+    3) **5–8 puces** factuelles (versions, breaking changes, composants impactés, dates, éditeurs) — **toutes distinctes**.
+    4) Une section **Liens / Links** (10–12 items max) au format :
        - **[FR]** ou **[EN]** — Titre court — URL (ajoute la **date/heure** si dispo).
        (Marque chaque lien avec [FR] ou [EN] selon la langue de la source.)
     5) Cite **uniquement des sources réelles** (URLs visibles). Indique [paywall] si nécessaire.
-    6) Aucune invention ; si incertain, précise-le. Évite les posts SEO à faible valeur.
-
-    Contexte :
-    - Langue de sortie : français ({LOCALE})
-    - Fuseau : {TZ}
-    - Fenêtre : {HOURS} heures
-    - Effectue **plusieurs recherches** si utile.
+    6) **Aucun doublon**. Aucune invention ; si incertain, précise-le. Pas de textes d'UI (share/publish/cookies).
 
     Format strictement Markdown. Pas de blocs de code inutiles.
     """).strip()
+
+# ---------- Post-processing: dedup bullets & links ----------
+def clean_bullets_and_links(bullets_md: str, links_md: str):
+    # Bullets
+    bullet_lines = _lines_from_markdown_block(bullets_md)
+    bullet_lines = _dedup_lines(bullet_lines, key_fn=_fingerprint, limit=MAX_BULLETS)
+
+    # Links
+    raw_link_lines = _extract_link_lines(links_md)
+    link_lines = _dedup_lines(raw_link_lines, key_fn=lambda s: _canonical_url(s), limit=None)
+    # re-limit after dedup
+    link_lines = link_lines[:MAX_LINKS]
+
+    return _format_bullets_md(bullet_lines), _format_links_md(link_lines)
 
 # ---------- Main ----------
 def main():
@@ -373,16 +495,18 @@ def main():
     fallback_title = f"Veille Dev — {date_str} (dernières {HOURS} h)"
     title, bullets, links = split_summary_links(md, fallback_title)
 
-    # Description: first short paragraph
-    first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
+    # Description: first short paragraph BEFORE dedup (garde le résumé initial)
+    first_para = re.split(r"\n\s*\n", (_normalize_text(bullets) or "").strip(), maxsplit=1)[0] if bullets.strip() else ""
     description = first_para
-    bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
+
+    # Dedup bullets & links, limit counts
+    bullets_body, links_clean = clean_bullets_and_links(bullets, links)
 
     post_discord_embeds(
         title=title,
         description=description,
         bullet_text=bullets_body,
-        links_text=links
+        links_text=links_clean
     )
 
 if __name__ == "__main__":
