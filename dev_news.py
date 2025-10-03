@@ -5,41 +5,51 @@ import requests
 # ---------- ENV ----------
 OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
-MODEL   = os.getenv("MODEL", "gpt-4.1-mini")
-HOURS   = int(os.getenv("HOURS", "24"))
-LOCALE  = os.getenv("LOCALE", "fr-FR")
-TZ      = os.getenv("TIMEZONE", "Europe/Paris")
-COLOR   = int(os.getenv("EMBED_COLOR", "15105570"))  # 0xE67E22
+MODEL        = os.getenv("MODEL", "gpt-4.1-mini")
+HOURS        = int(os.getenv("HOURS", "24"))
+LOCALE       = os.getenv("LOCALE", "fr-FR")
+SOURCE_LANGS = os.getenv("SOURCE_LANGS", "fr,en")  # FR + EN
+TZ           = os.getenv("TIMEZONE", "Europe/Paris")
+COLOR        = int(os.getenv("EMBED_COLOR", "15105570"))  # 0xE67E22 (orange)
 
 now_utc   = datetime.now(timezone.utc)
 since_utc = now_utc - timedelta(hours=HOURS)
 date_str  = now_utc.strftime("%Y-%m-%d")
 
-# ---------- Discord limits (safe) ----------
+# ---------- Discord limits (extra safe) ----------
 DISCORD_MAX_EMBEDS   = 10     # embeds per message
 DISCORD_MAX_EMBED    = 6000   # hard API limit
-EMBED_TARGET_BUDGET  = 5500   # target to keep margin
+EMBED_TARGET_BUDGET  = 3500   # aggressive target to keep margin
 DISCORD_MAX_TITLE    = 256
 DISCORD_MAX_DESC     = 4096
 FIELD_HARD_MAX       = 1024
-FIELD_SOFT_MAX       = 700
-DESC_SOFT_MAX        = 300
+FIELD_SOFT_MAX       = 450    # our target (<< 1024)
+DESC_SOFT_MAX        = 180    # short description
 
 # ---------- Helpers ----------
 def _text_len(s: str) -> int:
     return len(s or "")
 
+def _normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\r", "")
+    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)  # drop markdown headings inside chunks
+    s = re.sub(r"[ \t]{2,}", " ", s)                     # compress spaces
+    return s.strip()
+
 def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
-    """Split by lines, fall back to hard-split for very long lines (e.g., URLs)."""
-    txt = (txt or "").strip()
+    """Split by lines; hard-split very long lines (e.g., URLs)."""
+    txt = _normalize_text(txt)
     if not txt:
         return []
     lines, chunks, buf = txt.splitlines(), [], ""
     for line in lines:
+        line = line.strip()
         add_len = len(line) + (0 if not buf else 1)
         if len(buf) + add_len > size:
-            if buf.strip():
-                chunks.append(buf.rstrip())
+            if buf:
+                chunks.append(buf)
             if len(line) > size:
                 for i in range(0, len(line), size):
                     chunks.append(line[i:i+size])
@@ -48,9 +58,9 @@ def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
                 buf = line
         else:
             buf = (buf + "\n" + line) if buf else line
-    if buf.strip():
-        chunks.append(buf.rstrip())
-    return chunks
+    if buf:
+        chunks.append(buf)
+    return [c.strip()[:size] for c in chunks if c.strip()]
 
 def _clean_embed(e: dict) -> dict:
     """Remove None/empty & clamp base sizes."""
@@ -58,8 +68,10 @@ def _clean_embed(e: dict) -> dict:
     for k, v in e.items():
         if v is None:
             continue
-        if isinstance(v, str) and not v.strip():
-            continue
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                continue
         if k == "title":
             out[k] = v[:DISCORD_MAX_TITLE]
         elif k == "description":
@@ -67,8 +79,8 @@ def _clean_embed(e: dict) -> dict:
         elif k == "fields":
             vv = []
             for f in (v or []):
-                name = (f.get("name") or "").strip()
-                value = (f.get("value") or "").strip()
+                name = _normalize_text(f.get("name") or "")
+                value = _normalize_text(f.get("value") or "")
                 if name and value:
                     if len(value) > FIELD_SOFT_MAX:
                         value = value[:FIELD_SOFT_MAX] + "…"
@@ -90,15 +102,24 @@ def _embed_size(e: dict) -> int:
     size += _text_len(footer.get("text"))
     return size
 
-def _shrink_to_fit(e: dict):
-    """Reduce desc/field to fit under target, then under hard 6000 if needed."""
+def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
+    """
+    Reduce desc/field to pass under 'target', then <6000 if needed.
+    Aggressive stepwise cuts.
+    """
     e = _clean_embed(e)
+    # ensure short description early
+    if e.get("description") and len(e["description"]) > DESC_SOFT_MAX:
+        e["description"] = e["description"][:DESC_SOFT_MAX] + "…"
+        e = _clean_embed(e)
+
+    # target budget loop
     guard = 0
-    while _embed_size(e) > EMBED_TARGET_BUDGET and guard < 100:
+    while _embed_size(e) > target and guard < 100:
         guard += 1
         desc = e.get("description")
-        if desc and len(desc) > 120:
-            e["description"] = desc[:-80] + "…"
+        if desc and len(desc) > 90:
+            e["description"] = desc[:-60] + "…"
             e = _clean_embed(e)
             continue
         if e.get("fields"):
@@ -110,12 +131,13 @@ def _shrink_to_fit(e: dict):
                 continue
         break
 
+    # final safety: ensure < 6000
     guard = 0
     while _embed_size(e) > DISCORD_MAX_EMBED and guard < 100:
         guard += 1
         desc = e.get("description")
-        if desc and len(desc) > 50:
-            e["description"] = desc[:-50] + "…"
+        if desc and len(desc) > 30:
+            e["description"] = desc[:-30] + "…"
             e = _clean_embed(e)
             continue
         if e.get("fields"):
@@ -136,25 +158,58 @@ def _shrink_to_fit(e: dict):
         break
     return e
 
+def _retry_shrink_and_send(payload, max_retries=3):
+    """
+    If Discord returns 400 'Embed size exceeds ...', shrink more and retry.
+    """
+    for attempt in range(max_retries + 1):
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        if r.ok:
+            return
+        if "Embed size exceeds maximum size of 6000" not in r.text:
+            raise RuntimeError(f"Discord payload error: {r.status_code} {r.text}")
+
+        # more aggressive shrink for retry
+        next_embeds = []
+        for em in payload.get("embeds", []):
+            if em.get("description"):
+                limits = [120, 80, 50]
+                lim = limits[min(attempt, len(limits)-1)]
+                em["description"] = _normalize_text(em["description"])[:lim] + "…"
+            if em.get("fields"):
+                val = em["fields"][0]["value"]
+                limits = [350, 250, 200]
+                lim = limits[min(attempt, len(limits)-1)]
+                em["fields"][0]["value"] = _normalize_text(val)[:lim] + "…"
+            em = _shrink_to_fit(em, target=3000)
+            next_embeds.append(_clean_embed(em))
+        payload = {"embeds": next_embeds}
+    raise RuntimeError("Discord 400 after retries: embeds still exceed size after aggressive shrinking.")
+
 def _send_embeds_in_batches(embeds: list):
-    """Send in batches of up to 10 embeds (multiple messages if needed)."""
+    """Send in batches (≤10). Shrink + retry if needed."""
     for i in range(0, len(embeds), DISCORD_MAX_EMBEDS):
         batch = embeds[i:i+DISCORD_MAX_EMBEDS]
-        safe_batch = [_shrink_to_fit(em) for em in batch]
-        payload = {"embeds": [_clean_embed(em) for em in safe_batch if em.get("title") or em.get("description") or em.get("fields")]}
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-        if not r.ok:
-            raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
+        safe_batch = []
+        for j, em in enumerate(batch):
+            if j > 0 and "footer" in em:
+                em.pop("footer", None)  # footer only on first embed per request
+            em = _shrink_to_fit(em, target=EMBED_TARGET_BUDGET)
+            if _embed_size(em) > EMBED_TARGET_BUDGET:
+                em = _shrink_to_fit(em, target=3000)
+            safe_batch.append(_clean_embed(em))
+        payload = {"embeds": [em for em in safe_batch if em.get("title") or em.get("description") or em.get("fields")]}
+        _retry_shrink_and_send(payload, max_retries=3)
 
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Robust strategy:
-      - Embed #1: title + short description + footer (no fields)
-      - Then: 1 field per embed for bullets (chunks), then sources (chunks)
-      - Send multiple messages if >10 embeds
+    Strategy:
+      - Embed #1: title + short desc + footer (no fields)
+      - Then: 1 field per embed for 'Highlights' chunks, then 'Sources' chunks
+      - Multiple messages if >10 embeds
     """
     title = (title or "").strip()[:DISCORD_MAX_TITLE]
-    description = (description or "").strip()
+    description = _normalize_text(description)
     if len(description) > DESC_SOFT_MAX:
         description = description[:DESC_SOFT_MAX] + "…"
 
@@ -162,9 +217,9 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
         "title": title,
         "description": description if description else None,
         "color": COLOR,
-        "footer": {"text": f"Dev News • {date_str} • Window: {HOURS}h • {TZ}"},
+        "footer": {"text": f"Veille Dev • {date_str} • Window: {HOURS}h • {TZ}"},
     }
-    first_embed = _shrink_to_fit(first_embed)
+    first_embed = _shrink_to_fit(first_embed, target=EMBED_TARGET_BUDGET)
 
     embeds = [first_embed]
 
@@ -172,12 +227,12 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
     link_chunks   = chunk_text(links_text,  FIELD_SOFT_MAX) if links_text else []
 
     for idx, ch in enumerate(bullet_chunks):
-        e = {"color": COLOR, "fields": [{"name": "Highlights" if idx == 0 else "Highlights (cont.)", "value": ch}]}
-        embeds.append(_shrink_to_fit(e))
+        e = {"color": COLOR, "fields": [{"name": "Highlights" if idx == 0 else "Highlights (suite)", "value": ch}]}
+        embeds.append(_shrink_to_fit(e, target=EMBED_TARGET_BUDGET))
 
     for idx, ch in enumerate(link_chunks):
-        e = {"color": COLOR, "fields": [{"name": "Sources" if idx == 0 else "Sources (cont.)", "value": ch}]}
-        embeds.append(_shrink_to_fit(e))
+        e = {"color": COLOR, "fields": [{"name": "Sources" if idx == 0 else "Sources (suite)", "value": ch}]}
+        embeds.append(_shrink_to_fit(e, target=EMBED_TARGET_BUDGET))
 
     _send_embeds_in_batches(embeds)
 
@@ -226,11 +281,9 @@ def split_summary_links(md: str, fallback_title: str):
     if not md:
         return fallback_title, "", ""
 
-    # Title line if present
     title_match = re.search(r"^\s*#+\s*(.+)", md)
     title = title_match.group(1).strip() if title_match else fallback_title
 
-    # Split on "Links"/"Liens"
     parts = SECTION_LINKS_RE.split(md)
     if len(parts) < 2:
         parts = SECTION_LIENS_RE.split(md)
@@ -255,41 +308,42 @@ def split_summary_links(md: str, fallback_title: str):
 def build_prompt():
     """
     DEV NEWS scope:
-      - Programming languages (Python, JS/TS, Go, Rust, Java, C#, etc.)
-      - Frameworks & libraries (React, Vue, Angular, Django, FastAPI, Spring, .NET, etc.)
-      - Tooling & productivity (IDEs, package managers, linters, formatters)
-      - Releases & changelogs (major/minor), deprecations, breaking changes
-      - Cloud/DevOps/CI/CD, containers (Docker), IaC (Terraform), serverless
-      - Security advisories (CVE), supply chain (npm/pypi), performance
-      - Open standards/specs (TC39, WHATWG, W3C), databases
+      - Languages: Python, JS/TS, Go, Rust, Java, C#, etc.
+      - Frameworks/Libraries: React, Vue, Angular, Svelte, Django, FastAPI, Spring, .NET, etc.
+      - Tooling: package managers, build tools, linters/formatters, IDEs, CLIs
+      - Releases/Changelogs: major/minor, breaking changes, deprecations
+      - Cloud/DevOps/CI-CD: containers, serverless, IaC, performance
+      - Security: advisories (CVE), supply chain (npm/pypi/crates), patches
+      - Standards/Specs: TC39, WHATWG, W3C, IETF, databases
     """
+    langs_note = SOURCE_LANGS.replace(",", ", ")
     return textwrap.dedent(f"""
-    You are a technology watch agent specialized in **Software Development** news.
+    Tu es un agent de veille **Développement / Software Engineering**.
 
-    Task:
-    - Use **web search** to find **developer/engineering news** published between
-      **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** and **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
-    - Focus on: programming languages, frameworks, libraries, tooling, releases/changelogs,
-      dev productivity, cloud/devops/ci-cd, containers/serverless, security advisories (CVE),
-      package ecosystems (npm/pypi/crates), performance, open standards/specs.
+    Tâche :
+    - Utilise la **recherche web** pour identifier les **actualités dev** publiées entre
+      **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** et **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
+    - **Sources à considérer** : en **français et en anglais** ({langs_note}). Priorise la **source primaire**
+      (notes de version/changelogs officiels, blogs des projets, RFC/propositions TC39, etc.) et les médias réputés.
+      Évite les doublons d’un même événement.
 
-    Output in **French ({LOCALE})** and **Markdown**:
-    1) A title: "Veille Dev — {date_str} (dernières {HOURS} h)".
-    2) A short **global summary** (2–3 sentences).
-    3) **5–10 factual bullet points** (names, versions, numbers, breaking changes, vendors).
-    4) A **Liens / Links** section (10–15 items max) with format:
-       - Short title — URL (include **date/time** in parentheses if available).
-    5) Only cite **real sources with visible URLs**. If paywalled, mark [paywall].
-    6) No fabrication; note uncertainty if applicable.
+    Rendu en **français ({LOCALE})** et en **Markdown** :
+    1) Un titre : "Veille Dev — {date_str} (dernières {HOURS} h)".
+    2) Un **résumé global** (2–3 phrases).
+    3) **5–10 puces** factuelles (versions, breaking changes, composants impactés, dates, éditeurs).
+    4) Une section **Liens / Links** (10–15 items max) au format :
+       - **[FR]** ou **[EN]** — Titre court — URL (ajoute la **date/heure** si dispo).
+       (Marque chaque lien avec [FR] ou [EN] selon la langue de la source.)
+    5) Cite **uniquement des sources réelles** (URLs visibles). Indique [paywall] si nécessaire.
+    6) Aucune invention ; si incertain, précise-le. Évite les posts SEO à faible valeur.
 
-    Constraints:
-    - Language: French ({LOCALE})
-    - Reference timezone: {TZ}
-    - Time window: {HOURS} hours
-    - Perform **multiple searches** if needed.
-    - Avoid low-value SEO-only posts; prefer original sources and reputable outlets.
+    Contexte :
+    - Langue de sortie : français ({LOCALE})
+    - Fuseau : {TZ}
+    - Fenêtre : {HOURS} heures
+    - Effectue **plusieurs recherches** si utile.
 
-    Strictly Markdown. No unnecessary code fences.
+    Format strictement Markdown. Pas de blocs de code inutiles.
     """).strip()
 
 # ---------- Main ----------
@@ -319,7 +373,7 @@ def main():
     fallback_title = f"Veille Dev — {date_str} (dernières {HOURS} h)"
     title, bullets, links = split_summary_links(md, fallback_title)
 
-    # Description: first paragraph (short)
+    # Description: first short paragraph
     first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
     description = first_para
     bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""

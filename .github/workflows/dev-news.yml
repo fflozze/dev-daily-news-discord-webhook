@@ -51,9 +51,10 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LOCALE: "fr-FR"
+          SOURCE_LANGS: "fr,en"       # << FR + EN
           TIMEZONE: "Europe/Paris"
           HOURS: "24"
-          MODEL: "gpt-4.1-mini"     # possible: gpt-4.1
-          EMBED_COLOR: "15105570"   # 0xE67E22 (orange)
+          MODEL: "gpt-4.1-mini"       # possible: gpt-4.1
+          EMBED_COLOR: "15105570"     # 0xE67E22 (orange)
         run: |
           python dev_news.py
