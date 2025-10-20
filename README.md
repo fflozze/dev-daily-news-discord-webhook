@@ -17,10 +17,10 @@ This project uses **GitHub Actions** to find the latest dev-related news every 2
 
 ## 📂 Repository structure
 .
-├── .github/workflows/dev-news.yml # GitHub Actions workflow (automation) /n
-├── dev_news.py # Main Python script /n
-├── requirements.txt # Python dependencies /n
-└── README.md # Project documentation /n
+├── .github/workflows/dev-news.yml # GitHub Actions workflow (automation) /
+├── dev_news.py # Main Python script /
+├── requirements.txt # Python dependencies /
+└── README.md # Project documentation /
 
 ---
 
