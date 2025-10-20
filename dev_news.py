@@ -2,14 +2,18 @@ import os, json, textwrap, re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
 import requests
+from dotenv import load_dotenv
 
 # ---------- ENV ----------
+# Charger les variables d'environnement depuis .env
+load_dotenv()
+
 OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 MODEL        = os.getenv("MODEL", "gpt-4.1-mini")
 HOURS        = int(os.getenv("HOURS", "24"))
-LOCALE       = os.getenv("LOCALE", "fr-FR")
-SOURCE_LANGS = os.getenv("SOURCE_LANGS", "fr,en")  # FR + EN
+LOCALE       = os.getenv("LOCALE", "en-US")
+SOURCE_LANGS = os.getenv("SOURCE_LANGS", "en")  # EN only
 TZ           = os.getenv("TIMEZONE", "Europe/Paris")
 COLOR        = int(os.getenv("EMBED_COLOR", "15105570"))  # 0xE67E22 (orange)
 
@@ -67,10 +71,15 @@ def _normalize_text(s: str) -> str:
     return s.strip()
 
 def _fingerprint(s: str) -> str:
-    """Key for dedup of bullets: lowercase, drop punctuation, collapse spaces."""
+    """Key for dedup of bullets: lowercase, drop punctuation, collapse spaces, remove common words."""
     s = _normalize_text(s).lower()
     # remove URLs to avoid diff only by utm
     s = re.sub(r"https?://\S+", "", s)
+    # remove common stop words that don't add meaning
+    stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these", "those"}
+    words = re.findall(r'\b\w+\b', s)
+    words = [w for w in words if w not in stop_words and len(w) > 2]
+    s = " ".join(words)
     s = re.sub(r"[^\w]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -94,6 +103,46 @@ def _canonical_url(u: str) -> str:
         return urlunparse(new)
     except Exception:
         return u.strip()
+
+def _extract_title_from_link(link_text: str) -> str:
+    """Extract title from link text for better deduplication."""
+    # Remove markdown formatting and extract title
+    title = re.sub(r'^\s*[-*•]\s*', '', link_text.strip())
+    title = re.sub(r'\s*—\s*.*$', '', title)  # Remove everything after em dash
+    title = re.sub(r'\s*-\s*.*$', '', title)  # Remove everything after dash
+    return title.strip()
+
+def _extract_news_title_from_bullet(bullet_text: str) -> str:
+    """Extract a specific news title from bullet point text."""
+    if not bullet_text:
+        return "Highlights"
+    
+    # Look for patterns like "Company Name Releases/Announces/Introduces..."
+    title_patterns = [
+        r'^([^:]+?)\s+(?:releases?|announces?|introduces?|launches?|updates?|extends?)\s+',
+        r'^([^:]+?)\s+(?:version|update|changes?|improvements?)\s+',
+        r'^([^:]+?)\s+:\s*',
+        r'^([^:]+?)\s+—\s*',
+    ]
+    
+    for pattern in title_patterns:
+        match = re.search(pattern, bullet_text, re.IGNORECASE)
+        if match:
+            title = match.group(1).strip()
+            # Clean up the title
+            title = re.sub(r'\*\*', '', title)  # Remove bold formatting
+            title = re.sub(r'\s+', ' ', title)  # Normalize spaces
+            # Limit length for Discord field names (max 256 chars)
+            if len(title) > 50:
+                title = title[:47] + "..."
+            return title
+    
+    # Fallback: extract first few words
+    words = bullet_text.split()[:4]
+    fallback_title = " ".join(words)
+    if len(fallback_title) > 50:
+        fallback_title = fallback_title[:47] + "..."
+    return fallback_title or "Highlights"
 
 def _dedup_lines(lines, key_fn, limit):
     seen, out = set(), []
@@ -328,7 +377,7 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
         "title": title,
         "description": description if description else None,
         "color": COLOR,
-        "footer": {"text": f"Veille Dev • {date_str} • Window: {HOURS}h • {TZ}"},
+        "footer": {"text": f"Dev News • {date_str} • Window: {HOURS}h • {TZ}"},
     }
     first_embed = _shrink_to_fit(first_embed, target=EMBED_TARGET_BUDGET)
 
@@ -338,7 +387,11 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
     link_chunks   = chunk_text(links_text,  FIELD_SOFT_MAX) if links_text else []
 
     for idx, ch in enumerate(bullet_chunks):
-        e = {"color": COLOR, "fields": [{"name": "Highlights" if idx == 0 else "Highlights (suite)", "value": ch}]}
+        # Extract specific title from the first line of the chunk
+        first_line = ch.split('\n')[0] if ch else ""
+        field_title = _extract_news_title_from_bullet(first_line)
+        
+        e = {"color": COLOR, "fields": [{"name": field_title, "value": ch}]}
         embeds.append(_shrink_to_fit(e, target=EMBED_TARGET_BUDGET))
 
     for idx, ch in enumerate(link_chunks):
@@ -431,27 +484,26 @@ def build_prompt():
     """
     langs_note = SOURCE_LANGS.replace(",", ", ")
     return textwrap.dedent(f"""
-    Tu es un agent de veille **Développement / Software Engineering**. Ne garde que des infos
-    **centrées sur le développement** (langages, frameworks, toolchains, releases, DevOps/CI, specs/standards).
+    You are a **Development / Software Engineering** monitoring agent. Only keep information
+    **focused on development** (languages, frameworks, toolchains, releases, DevOps/CI, specs/standards).
 
-    Tâche :
-    - Utilise la **recherche web** pour identifier les **actualités dev** publiées entre
-      **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** et **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
-    - **Sources à considérer** : en **français et en anglais** ({langs_note}). Priorise la **source primaire**
-      (notes de version/changelogs officiels, blogs des projets, RFC/propositions TC39, etc.) et les médias réputés.
-      **Évite absolument les doublons** d’un même événement.
+    Task:
+    - Use **web search** to identify **dev news** published between
+      **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** and **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
+    - **Sources to consider**: in **English** ({langs_note}). Prioritize **primary sources**
+      (official release notes/changelogs, project blogs, RFC/TC39 proposals, etc.) and reputable media.
+      **Absolutely avoid duplicates** of the same event.
 
-    Rendu en **français ({LOCALE})** et en **Markdown** :
-    1) Un titre : "Veille Dev — {date_str} (dernières {HOURS} h)".
-    2) Un **résumé global** (2–3 phrases).
-    3) **5–8 puces** factuelles (versions, breaking changes, composants impactés, dates, éditeurs) — **toutes distinctes**.
-    4) Une section **Liens / Links** (10–12 items max) au format :
-       - **[FR]** ou **[EN]** — Titre court — URL (ajoute la **date/heure** si dispo).
-       (Marque chaque lien avec [FR] ou [EN] selon la langue de la source.)
-    5) Cite **uniquement des sources réelles** (URLs visibles). Indique [paywall] si nécessaire.
-    6) **Aucun doublon**. Aucune invention ; si incertain, précise-le. Pas de textes d'UI (share/publish/cookies).
+    Output in **English ({LOCALE})** and in **Markdown**:
+    1) A title: "Dev News — {date_str} (last {HOURS} h)".
+    2) A **global summary** (2–3 sentences).
+    3) **5–8 bullet points** factual (versions, breaking changes, impacted components, dates, publishers) — **all distinct**.
+    4) A **Links** section (10–12 items max) in format:
+       - **Title** — URL (add **date/time** if available).
+    5) Cite **only real sources** (visible URLs). Indicate [paywall] if necessary.
+    6) **No duplicates**. No invention; if uncertain, specify it. No UI texts (share/publish/cookies).
 
-    Format strictement Markdown. Pas de blocs de code inutiles.
+    Strictly Markdown format. No unnecessary code blocks.
     """).strip()
 
 # ---------- Post-processing: dedup bullets & links ----------
@@ -460,9 +512,17 @@ def clean_bullets_and_links(bullets_md: str, links_md: str):
     bullet_lines = _lines_from_markdown_block(bullets_md)
     bullet_lines = _dedup_lines(bullet_lines, key_fn=_fingerprint, limit=MAX_BULLETS)
 
-    # Links
+    # Links - improved deduplication using both URL and title
     raw_link_lines = _extract_link_lines(links_md)
-    link_lines = _dedup_lines(raw_link_lines, key_fn=lambda s: _canonical_url(s), limit=None)
+    
+    def link_key_fn(link_text: str) -> str:
+        """Create dedup key using both URL and title."""
+        url = _canonical_url(link_text)
+        title = _extract_title_from_link(link_text)
+        # Use both URL and title for better deduplication
+        return f"{url}|{_fingerprint(title)}"
+    
+    link_lines = _dedup_lines(raw_link_lines, key_fn=link_key_fn, limit=None)
     # re-limit after dedup
     link_lines = link_lines[:MAX_LINKS]
 
@@ -474,9 +534,9 @@ def main():
     try:
         md = call_openai_websearch(prompt)
     except Exception as e:
-        err = f"⚠️ Erreur durant la recherche/synthèse : {e}"
+        err = f"⚠️ Error during search/synthesis: {e}"
         post_discord_embeds(
-            title=f"Veille Dev — {date_str} (dernières {HOURS} h)",
+            title=f"Dev News — {date_str} (last {HOURS} h)",
             description=err,
             bullet_text="",
             links_text=""
@@ -485,14 +545,14 @@ def main():
 
     if not md or len(md.strip()) < 30:
         post_discord_embeds(
-            title=f"Veille Dev — {date_str} (dernières {HOURS} h)",
-            description="Aucune sortie exploitable retournée par l'IA (clé API/modèle ?).",
+            title=f"Dev News — {date_str} (last {HOURS} h)",
+            description="No usable output returned by AI (API key/model issue?).",
             bullet_text="",
             links_text=""
         )
         return
 
-    fallback_title = f"Veille Dev — {date_str} (dernières {HOURS} h)"
+    fallback_title = f"Dev News — {date_str} (last {HOURS} h)"
     title, bullets, links = split_summary_links(md, fallback_title)
 
     # Description: first short paragraph BEFORE dedup (garde le résumé initial)
